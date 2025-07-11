@@ -33,11 +33,11 @@ Para acessar o sistema da placa, há duas opções:
 
  * Pela própria USB. Se você tiver ligado a placa a um computador, execute:
    ```bash
-   sudo screen /dev/ttyUSB1 115200,cs8,-parenb,-cstopb
+   sudo picocom -b 115200 -d 8 -p 1 -y n /dev/ttyUSB1
    ```
    Se não aparecer nada na tela, aperte ENTER.
 
-   Para encerrar a sessão, pressione as teclas **Ctrl A** e, depos de soltá-las, pressione a tecla **K** e, por fim, **Y**.
+   Para encerrar a sessão, pressione as teclas **Ctrl A** e, depos de soltá-las, pressione as teclas **Ctrl+X**.
 
    Se você estiver usando Windows, use o HyperTerminal ou algum programa similar. Apenas note que a placa expõe duas portas seriais pela USB, e você deve acessar a segunda dentre elas. Confira se a velocidade está configurada para 115200 bps.
 
