@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+import re
+# Importações adicionadas para a pilha de rede
+from ip import IP
+from slip import CamadaEnlace
+from camadafisica import ZyboSerialDriver
+
+class ServidorIRC:
+    def __init__(self):
+        self.usuarios = {}
+        self.canais = {}
+
+    def iniciar(self):
+        """
+        Este método agora configura a pilha de rede completa (camadas física,
+        de enlace e de rede) antes de iniciar o servidor TCP da aplicação.
+        """
+        # Configuração da rede baseada em placa3.py
+        nossa_ponta = '192.168.200.4'
+        outra_ponta = '192.168.200.3'
+        porta_tcp = 6667  # Porta padrão do IRC
+
+        # Inicialização das camadas
+        driver = ZyboSerialDriver()
+        linha_serial = driver.obter_porta(0)
+
+        enlace = CamadaEnlace({outra_ponta: linha_serial})
+        rede = IP(enlace)
+        rede.definir_endereco_host(nossa_ponta)
+        rede.definir_tabela_encaminhamento([
+            ('0.0.0.0/0', outra_ponta)
+        ])
+
+        # O Servidor TCP agora recebe a camada de rede (IP)
+        servidor = Servidor(rede, porta_tcp)
+        servidor.registrar_monitor_de_conexoes_aceitas(self.conexao_aceita)
+
+    def validar_nome(self, nome):
+        return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+    # Passo 8: Notifica os usuários que estiverem em um canal em comum com o usuário que fechou a conexão
+    # Passo 10: Remove o usuário das listas de membros dos canais em que ele estava
+    def sair(self, conexao):
+        print(conexao, 'conexão fechada')
+        estado_saindo = self.usuarios.get(conexao)
+
+        if not estado_saindo or 'nick' not in estado_saindo:
+            if conexao in self.usuarios:
+                del self.usuarios[conexao]
+            conexao.fechar()
+            return
+
+        nick_usuario = estado_saindo['nick']
+
+        # Encontra usuários que estiverem em pelo menos um canal em comum com o usuário que desconectou
+        notifica_usuario = set()
+        for membros in self.canais.values():
+            if conexao in membros:
+                for membro in membros:
+                    if membro != conexao:
+                        notifica_usuario.add(membro)
+
+        # QUIT
+        msg_quit = b':' + nick_usuario + b' QUIT :Connection closed\r\n'
+        for membro in notifica_usuario:
+            membro.enviar(msg_quit)
+
+        # Remove usuário de todos os canais
+        canais_removidos = [nome for nome, membros in self.canais.items()
+                            if conexao in membros and (membros.remove(conexao) or not membros)]
+        for nome in canais_removidos:
+            del self.canais[nome]
+
+        del self.usuarios[conexao]
+        conexao.fechar()
+
+    # Passo 2: Tratamento de mensagens parciais ou múltiplas
+    def dados_recebidos(self, conexao, dados):
+        if dados == b'':
+            self.sair(conexao)
+            return
+
+        estado_usuario = self.usuarios[conexao]
+        estado_usuario['buffer'] += dados
+
+        while b'\r\n' in estado_usuario['buffer']:
+            msg, msg_restante = estado_usuario['buffer'].split(b'\r\n', 1)
+            estado_usuario['buffer'] = msg_restante
+            self.processar_comando(conexao, msg)
+
+    def conexao_aceita(self, conexao):
+        print(conexao, 'nova conexão')
+        self.usuarios[conexao] = {'buffer': b''}
+        conexao.registrar_recebedor(self.dados_recebidos)
+
+    def processar_comando(self, conexao, mensagem):
+        mensagem = mensagem.strip()
+        if not mensagem:
+            return
+
+        print(f"Processando: {mensagem.decode(errors='ignore')}")
+
+        partes = mensagem.split(b' ', 1)
+        comando = partes[0].upper()
+        args = partes[1] if len(partes) > 1 else b''
+        estado_cliente = self.usuarios[conexao]
+        nick_cliente = estado_cliente.get('nick')
+
+        if nick_cliente is None and comando not in [b'NICK', b'PING']:
+            return
+
+        handlers = {
+            b'PING': self.ping,
+            b'NICK': self.nick,
+            b'JOIN': self.join,
+            b'PART': self.part,
+            b'PRIVMSG': self.privmsg,
+        }
+
+        handler = handlers.get(comando)
+        if handler is not None:
+            handler(conexao, args)
+
+    def conexao_por_nick(self, nick):
+        nick = nick.lower()
+        for conexao, estado in self.usuarios.items():
+            if estado.get('nick', b'').lower() == nick:
+                return conexao
+        return None
+
+    # Passo 1: Implentação do comando PING
+    def ping(self, conexao, args):
+        conexao.enviar(b':server PONG server :' + args + b'\r\n')
+
+    # Passo 3: Implentação do comando NICK
+    # Passo 4: Validação e troca de apelidos
+    def nick(self, conexao, args):
+        novo_nick = args
+        estado_usuario = self.usuarios[conexao]
+        nick_atual = estado_usuario.get('nick', b'*')
+
+        if not self.validar_nome(novo_nick):
+            conexao.enviar(b':server 432 ' + nick_atual + b' ' + novo_nick + b' :Erroneous nickname\r\n')
+            return
+
+        conexao_usuario = self.conexao_por_nick(novo_nick)
+        if conexao_usuario and conexao_usuario != conexao:
+            conexao.enviar(b':server 433 ' + nick_atual + b' ' + novo_nick + b' :Nickname is already in use\r\n')
+        else:
+            estado_usuario['nick'] = novo_nick
+            if nick_atual == b'*':
+                conexao.enviar(b':server 001 ' + novo_nick + b' :Welcome\r\n')
+                conexao.enviar(b':server 422 ' + novo_nick + b' :MOTD File is missing\r\n')
+            else:
+                conexao.enviar(b':' + nick_atual + b' NICK ' + novo_nick + b'\r\n')
+
+    # Passo 5: Implentação do comando PRIVMSG
+    def privmsg(self, conexao, args):
+        remetente = self.usuarios[conexao].get('nick')
+        if b' :' not in args: return
+
+        destinatario, conteudo = args.split(b' :', 1)
+        msg = b':' + remetente + b' PRIVMSG ' + destinatario + b' :' + conteudo + b'\r\n'
+        if destinatario.startswith(b'#'):
+            canal_lwr = destinatario.lower()
+            if canal_lwr in self.canais and conexao in self.canais[canal_lwr]:
+                for membro in self.canais[canal_lwr]:
+                    if membro != conexao:
+                        membro.enviar(msg)
+        else:
+            conexao_destinatario = self.conexao_por_nick(destinatario)
+            if conexao_destinatario:
+                conexao_destinatario.enviar(msg)
+
+    # Passo 6: Implentação do comando JOIN
+    # Passo 9: Envia lista de membros do canal
+    def join(self, conexao, args):
+        remetente = self.usuarios[conexao]['nick']
+        canal = args.split(b' ')[0]
+
+        if not canal.startswith(b'#') or not self.validar_nome(canal[1:]):
+            conexao.enviar(b':server 403 ' + canal + b' :No such channel\r\n')
+            return
+
+        canal_lwr = canal.lower()
+
+        if canal_lwr not in self.canais:
+            self.canais[canal_lwr] = []
+
+        if conexao not in self.canais[canal_lwr]:
+            self.canais[canal_lwr].append(conexao)
+            msg_join = b':' + remetente + b' JOIN :' + canal + b'\r\n'
+            for membro in self.canais[canal_lwr]:
+                membro.enviar(msg_join)
+
+        # Envia a lista de membros
+        membros = sorted([self.usuarios[c]['nick'] for c in self.canais[canal_lwr] if c in self.usuarios and 'nick' in self.usuarios[c]])
+        prefixo = b':server 353 ' + remetente + b' = ' + canal + b' :'
+        conexao.enviar(prefixo + b' '.join(membros) + b'\r\n')
+        conexao.enviar(b':server 366 ' + remetente + b' ' + canal + b' :End of /NAMES list.\r\n')
+
+    # Passo 7: Implentação do comando PART
+    def part(self, conexao, args):
+        remetente = self.usuarios[conexao]['nick']
+        canal = args.split(b' ')[0]
+        canal_lwr = canal.lower()
+
+        if canal_lwr in self.canais and conexao in self.canais[canal_lwr]:
+            membros = self.canais[canal_lwr]
+            msg_part = b':' + remetente + b' PART ' + canal + b'\r\n'
+            for membro in membros:
+                membro.enviar(msg_part)
+
+            membros.remove(conexao)
+            if not membros:
+                del self.canais[canal_lwr]
+
+# main
+if __name__ == '__main__':
+    servidor_irc = ServidorIRC()
+    servidor_irc.iniciar()
+    # O loop de eventos agora é executado aqui, no ponto de entrada do script
+    asyncio.get_event_loop().run_forever()
